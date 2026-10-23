@@ -1,17 +1,14 @@
-name: Build Cipher Scan APK
+name: Build Cipher Scan APK and AAB
 
 on:
   workflow_dispatch:
     inputs:
       mac_test:
-        description: 'Build MAC Test app (target 31)'
-        required: false
+        description: Build experimental MAC Test app
         type: boolean
-        default: true
-
+        default: false
   push:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
   contents: read
@@ -20,14 +17,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    env:
-      SCAN_MAC_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.mac_test && 'true' || 'false' }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -36,18 +30,15 @@ jobs:
       - name: Set up Android
         uses: android-actions/setup-android@v4
 
-      - name: Set up Gradle
+      - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: '8.11.1'
 
-      - name: Install Android SDK and native tools
-        shell: bash
+      - name: Install Android SDK
         run: |
-          set -euo pipefail
-
           sdkmanager \
-            "platforms;android-35" \
+            "platforms;android-36" \
             "build-tools;35.0.0" \
             "ndk;27.0.12077973" \
             "cmake;3.22.1"
@@ -57,113 +48,151 @@ jobs:
         run: |
           set -euo pipefail
 
-          shopt -s nullglob
-          archives=(CipherScan*.zip)
-
-          if [ "${#archives[@]}" -ne 1 ]; then
-            echo 'Keep exactly one CipherScan project ZIP in the repository root.'
-            exit 1
-          fi
-
-          unzip -q "${archives[0]}" -d extracted
-
-          if [ ! -f extracted/CipherScan/app/build.gradle ]; then
-            echo 'CipherScan project was not found inside the ZIP.'
-            exit 1
-          fi
-
-          if [ "$SCAN_MAC_TEST" = true ]; then
-            if ! grep -q SCAN_MAC_TEST extracted/CipherScan/app/build.gradle; then
-              echo 'Upload the updated CipherScan_Project.zip first.'
+          if [ -f app/build.gradle ]; then
+            PROJECT="$GITHUB_WORKSPACE"
+          elif [ -f CipherScan/app/build.gradle ]; then
+            PROJECT="$GITHUB_WORKSPACE/CipherScan"
+          else
+            if [ ! -f CipherScan_Project.zip ]; then
+              echo "CipherScan_Project.zip is missing."
               exit 1
             fi
+
+            unzip -q CipherScan_Project.zip -d extracted
+            PROJECT="$GITHUB_WORKSPACE/extracted/CipherScan"
           fi
 
-      - name: Restore signing key when available
+          if [ ! -f "$PROJECT/app/build.gradle" ]; then
+            echo "Android project not found."
+            exit 1
+          fi
+
+          echo "SCAN_PROJECT=$PROJECT" >> "$GITHUB_ENV"
+
+      - name: Restore existing signing key
         env:
           KEY_DATA: ${{ secrets.CIPHER_SCAN_KEYSTORE || secrets.CIPHER_NEST_KEYSTORE }}
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
 
-          if [ -n "$KEY_DATA" ]; then
-            printf '%s' "$KEY_DATA" | base64 --decode > "$RUNNER_TEMP/cipherscan.p12"
-
-            chmod 600 "$RUNNER_TEMP/cipherscan.p12"
-
-            echo "CIPHER_KEYSTORE_PATH=$RUNNER_TEMP/cipherscan.p12" >> "$GITHUB_ENV"
-            echo "SCAN_VARIANT=release" >> "$GITHUB_ENV"
-          else
-            echo "SCAN_VARIANT=debug" >> "$GITHUB_ENV"
+          if [ -z "$KEY_DATA" ]; then
+            echo "Signing secret is missing."
+            echo "Add your ORIGINAL key as CIPHER_SCAN_KEYSTORE."
+            echo "Do not generate a replacement key for an existing installation."
+            exit 1
           fi
 
-      - name: Test and build APK
-        working-directory: extracted/CipherScan
+          printf '%s' "$KEY_DATA" |
+            base64 --decode > "$RUNNER_TEMP/cipherscan.p12"
+
+          echo "CIPHER_KEYSTORE_PATH=$RUNNER_TEMP/cipherscan.p12" >> "$GITHUB_ENV"
+
+      - name: Run source tests
         shell: bash
         run: |
           set -euo pipefail
+          cd "$SCAN_PROJECT"
+
+          cc -Wall -Wextra -Werror \
+            tests/neighbor_core_test.c \
+            app/src/main/cpp/neighbor_core.c \
+            -o "$RUNNER_TEMP/cipher-neighbor-test"
+
+          "$RUNNER_TEMP/cipher-neighbor-test"
+
+          TEST_DIR="$RUNNER_TEMP/cipherscan-tests"
+          SRC="app/src/main/java/com/cipherscan/network"
+
+          mkdir -p "$TEST_DIR"
+
+          javac -d "$TEST_DIR" \
+            "$SRC/Ipv4.java" \
+            "$SRC/DeviceFilter.java" \
+            "$SRC/WifiChannels.java" \
+            "$SRC/NeighborParser.java" \
+            "$SRC/WifiLabels.java" \
+            tests/Ipv4Test.java \
+            tests/DeviceFilterTest.java \
+            tests/WifiChannelsTest.java \
+            tests/NeighborParserTest.java \
+            tests/WifiLabelsTest.java
+
+          for TEST in \
+            Ipv4Test \
+            DeviceFilterTest \
+            WifiChannelsTest \
+            NeighborParserTest \
+            WifiLabelsTest
+          do
+            java -cp "$TEST_DIR" \
+              "com.cipherscan.network.$TEST"
+          done
+
+      - name: Build release APK and AAB
+        env:
+          SCAN_MAC_TEST: ${{ inputs.mac_test && 'true' || 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SCAN_PROJECT"
 
           export SCAN_VERSION_CODE=$(( $(date +%s) / 60 ))
 
-          echo "MAC Test enabled: $SCAN_MAC_TEST"
-
-          mkdir -p "$RUNNER_TEMP/cipherscan-tests"
-
-          javac -d "$RUNNER_TEMP/cipherscan-tests" \
-            app/src/main/java/com/cipherscan/network/Ipv4.java \
-            tests/Ipv4Test.java
-
-          java -cp "$RUNNER_TEMP/cipherscan-tests" \
-            com.cipherscan.network.Ipv4Test
-
-          if [ "$SCAN_VARIANT" = release ]; then
-            gradle --no-daemon assembleRelease
-          else
-            gradle --no-daemon assembleDebug
-          fi
+          gradle --no-daemon \
+            lintRelease \
+            testReleaseUnitTest \
+            assembleRelease \
+            bundleRelease
 
       - name: Verify and copy APK
+        env:
+          MAC_TEST: ${{ inputs.mac_test && 'true' || 'false' }}
         shell: bash
         run: |
           set -euo pipefail
 
-          APK="extracted/CipherScan/app/build/outputs/apk/$SCAN_VARIANT/app-$SCAN_VARIANT.apk"
+          APK="$SCAN_PROJECT/app/build/outputs/apk/release/app-release.apk"
 
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" \
+            verify "$APK"
 
-          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
-          BADGING=$("$AAPT" dump badging "$APK")
-
-          if [ "$SCAN_MAC_TEST" = true ]; then
-            if ! grep -q "targetSdkVersion:'31'" <<< "$BADGING"; then
-              echo 'Incorrect target SDK. Expected target 31.'
-              exit 1
-            fi
-
-            if ! grep -q "package: name='com.cipherscan.mactest'" <<< "$BADGING"; then
-              echo 'Incorrect package. Expected MAC Test app.'
-              exit 1
-            fi
-
-            OUTPUT_NAME=CipherScan-MAC-Test
+          if [ "$MAC_TEST" = true ]; then
+            cp "$APK" "$GITHUB_WORKSPACE/CipherScan-MAC-Test.apk"
           else
-            OUTPUT_NAME=CipherScan
+            cp "$APK" "$GITHUB_WORKSPACE/CipherScan.apk"
           fi
 
-          mkdir -p output
-          cp "$APK" "output/$OUTPUT_NAME.apk"
-
-          echo "OUTPUT_NAME=$OUTPUT_NAME" >> "$GITHUB_ENV"
-
-      - name: Remove temporary signing key
-        if: always()
+      - name: Verify and copy Play Store AAB
+        if: ${{ !inputs.mac_test }}
         shell: bash
         run: |
-          rm -f "$RUNNER_TEMP/cipherscan.p12"
+          set -euo pipefail
+
+          BUNDLE="$SCAN_PROJECT/app/build/outputs/bundle/release/app-release.aab"
+
+          test -s "$BUNDLE"
+          jarsigner -verify "$BUNDLE"
+
+          cp "$BUNDLE" "$GITHUB_WORKSPACE/CipherScan-Play.aab"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.OUTPUT_NAME }}-APK
-          path: output/*.apk
+          name: ${{ inputs.mac_test && 'CipherScan-MAC-Test-APK' || 'CipherScan-APK' }}
+          path: CipherScan*.apk
           if-no-files-found: error
+
+      - name: Upload Play Store AAB
+        if: ${{ !inputs.mac_test }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: CipherScan-Play-AAB
+          path: CipherScan-Play.aab
+          if-no-files-found: error
+
+      - name: Remove temporary signing key
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/cipherscan.p12"
