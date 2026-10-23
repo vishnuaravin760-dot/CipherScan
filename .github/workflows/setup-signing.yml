@@ -1,0 +1,52 @@
+name: Setup Cipher Scan Signing Key
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Generate permanent signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          mkdir -p "$RUNNER_TEMP/signing"
+
+          keytool -genkeypair \
+            -keystore "$RUNNER_TEMP/cipherscan.p12" \
+            -storetype PKCS12 \
+            -storepass cipher-nest-signing \
+            -keypass cipher-nest-signing \
+            -alias ciphernest \
+            -keyalg RSA \
+            -keysize 3072 \
+            -validity 10000 \
+            -dname "CN=Cipher, OU=Android, O=Cipher, C=IN"
+
+          base64 -w 0 "$RUNNER_TEMP/cipherscan.p12" \
+            > "$RUNNER_TEMP/signing/CIPHER_SCAN_KEYSTORE.txt"
+
+      - name: Download private signing backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: PRIVATE-CipherScan-Signing
+          path: ${{ runner.temp }}/signing/CIPHER_SCAN_KEYSTORE.txt
+          retention-days: 1
+
+      - name: Clean temporary files
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/cipherscan.p12"
+          rm -rf "$RUNNER_TEMP/signing"
